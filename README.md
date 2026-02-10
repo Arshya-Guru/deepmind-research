@@ -1,98 +1,298 @@
-# DeepMind Research
+# byol3d
 
-This repository contains implementations and illustrative code to accompany
-DeepMind publications. Along with publishing papers to accompany research
-conducted at DeepMind, we release open-source
-[environments](https://deepmind.com/research/open-source/open-source-environments/),
-[data sets](https://deepmind.com/research/open-source/open-source-datasets/),
-and [code](https://deepmind.com/research/open-source/open-source-code/) to
-enable the broader research community to engage with our work and build upon it,
-with the ultimate goal of accelerating scientific progress to benefit society.
-For example, you can build on our implementations of the
-[Deep Q-Network](https://github.com/deepmind/dqn) or
-[Differential Neural Computer](https://github.com/deepmind/dnc), or experiment
-in the same environments we use for our research, such as
-[DeepMind Lab](https://github.com/deepmind/lab) or
-[StarCraft II](https://github.com/deepmind/pysc2).
+BYOL (Bootstrap Your Own Latent) self-supervised pretraining adapted for 3D lightsheet microscopy, targeting Aβ plaque segmentation.
 
-If you enjoy building tools, environments, software libraries, and other
-infrastructure of the kind listed below, you can view open positions to work in
-related areas on our [careers page](https://deepmind.com/careers/).
+Reimplemented in PyTorch from [DeepMind's original JAX/Haiku codebase](https://github.com/deepmind/deepmind-research/tree/master/byol) (Grill et al., 2020). The original 2D ResNet + ImageNet pipeline is replaced with a 3D U-Net encoder operating on single-channel fluorescence volumes.
 
-For a full list of our publications, please see
-https://deepmind.com/research/publications/
+## Why BYOL over SimCLR
 
-## Projects
+- **No negative pairs** → robust at small batch sizes (2–16). SimCLR performance collapses below batch 256.
+- **Augmentation tolerant** → BYOL degrades ~3 pts with fewer augmentations vs ~10 pts for SimCLR (paper Table 5).
+- **3D memory constraints** → 96³ crops × batch 16 already pushes 20–30 GB VRAM. BYOL doesn't need the massive batches SimCLR requires.
 
-*   [Magnetic control of tokamak plasmas through deep reinforcement learning](fusion_tcv), Nature 2022
-*   [Pushing the Frontiers of Density Functionals by Solving the Fractional Electron Problem](density_functional_approximation_dm21), Science 2021
-*   [Mind the Gap: Assessing Temporal Generalization in Neural Language Models](pitfalls_static_language_models), NeurIPS 2021
-*   [The Difficulty of Passive Learning in Deep Reinforcement Learning](tandem_dqn), NeurIPS 2021
-*   [Skilful precipitation nowcasting using deep generative models of radar](nowcasting), Nature 2021
-*   [Compute-Aided Design as Language](cadl)
-*   [Encoders and ensembles for continual learning](continual_learning)
-*   [Towards mental time travel: a hierarchical memory for reinforcement learning agents](hierarchical_transformer_memory)
-*   [Perceiver IO: A General Architecture for Structured Inputs & Outputs](perceiver)
-*   [Solving Mixed Integer Programs Using Neural Networks](neural_mip_solving)
-*   [A Realistic Simulation Framework for Learning with Label Noise](noisy_label)
-*   [Rapid Task-Solving in Novel Environments](rapid_task_solving), ICLR 2021
-*   [WikiGraphs: A Wikipedia - Knowledge Graph Paired Dataset](wikigraphs), TextGraphs 2021
-*   [Behavior Priors for Efficient Reinforcement Learning](box_arrangement)
-*   [Learning Mesh-Based Simulation with Graph Networks](meshgraphnets), ICLR 2021
-*   [Open Graph Benchmark - Large-Scale Challenge (OGB-LSC)](ogb_lsc)
-*   [Synthetic Returns for Long-Term Credit Assignment](synthetic_returns)
-*   [A Deep Learning Approach for Characterizing Major Galaxy Mergers](galaxy_mergers)
-*   [Better, Faster Fermionic Neural Networks](kfac_ferminet_alpha) (KFAC implementation)
-*   [Object-based attention for spatio-temporal reasoning](object_attention_for_reasoning)
-*   [Effective gene expression prediction from sequence by integrating long-range interactions](enformer)
-*   [Satore: First-order logic saturation with atom rewriting](satore)
-*   [Characterizing signal propagation to close the performance gap in unnormalized ResNets](nfnets), ICLR 2021
-*   [Uncovering the Limits of Adversarial Training against Norm-Bounded Adversarial Examples](adversarial_robustness)
-*   [Learning rich touch representations through cross-modal self-supervision](cmtouch), CoRL 2020
-*   [Functional Regularisation for Continual Learning](functional_regularisation_for_continual_learning), ICLR 2020
-*   [The Autoencoding Variational Autoencoder](avae), NeurIPS 2020
-*   [Self-Supervised MultiModal Versatile Networks](mmv), NeurIPS 2020
-*   [ODE-GAN: Training GANs by Solving Ordinary Differential Equations](ode_gan), NeurIPS 2020
-*   [Algorithms for Causal Reasoning in Probability Trees](causal_reasoning)
-*   [Gated Linear Networks](gated_linear_networks), NeurIPS 2020
-*   [Value-driven Hindsight Modelling](himo), NeurIPS 2020
-*   [Targeted free energy estimation via learned mappings](learned_free_energy_estimation), Journal of Chemical Physics 2020
-*   [Learning to Simulate Complex Physics with Graph Networks](learning_to_simulate), ICML 2020
-*   [Physically Embedded Planning Problems](physics_planning_games)
-*   [PolyGen: PolyGen: An Autoregressive Generative Model of 3D Meshes](polygen), ICML 2020
-*   [Bootstrap Your Own Latent](byol)
-*   [Catch & Carry: Reusable Neural Controllers for Vision-Guided Whole-Body Tasks](catch_carry), SIGGRAPH 2020
-*   [MEMO: A Deep Network For Flexible Combination Of Episodic Memories](memo), ICLR 2020
-*   [RL Unplugged: Benchmarks for Offline Reinforcement Learning](rl_unplugged)
-*   [Disentangling by Subspace Diffusion (GEOMANCER)](geomancer), NeurIPS 2020
-*   [What can I do here? A theory of affordances in reinforcement learning](affordances_theory), ICML 2020
-*   [Scaling data-driven robotics with reward sketching and batch reinforcement learning](sketchy), RSS 2020
-*   [Path-Specific Counterfactual Fairness](counterfactual_fairness), AAAI 2019
-*   [The Option Keyboard: Combining Skills in Reinforcement Learning](option_keyboard), NeurIPS 2019
-*   [VISR - Fast Task Inference with Variational Intrinsic Successor Features](visr), ICLR 2020
-*   [Unveiling the predictive power of static structure in glassy systems](glassy_dynamics), Nature Physics 2020
-*   [Multi-Object Representation Learning with Iterative Variational Inference (IODINE)](iodine)
-*   [AlphaFold CASP13](alphafold_casp13), Nature 2020
-*   [Unrestricted Adversarial Challenge](unrestricted_advx)
-*   [Hierarchical Probabilistic U-Net (HPU-Net)](hierarchical_probabilistic_unet)
-*   [Training Language GANs from Scratch](scratchgan), NeurIPS 2019
-*   [Temporal Value Transport](tvt), Nature Communications 2019
-*   [Continual Unsupervised Representation Learning (CURL)](curl), NeurIPS 2019
-*   [Unsupervised Learning of Object Keypoints (Transporter)](transporter), NeurIPS 2019
-*   [BigBiGAN](bigbigan), NeurIPS 2019
-*   [Deep Compressed Sensing](cs_gan), ICML 2019
-*   [Side Effects Penalties](side_effects_penalties)
-*   [PrediNet Architecture and Relations Game Datasets](PrediNet)
-*   [Unsupervised Adversarial Training](unsupervised_adversarial_training), NeurIPS 2019
-*   [Graph Matching Networks for Learning the Similarity of Graph Structured
-    Objects](graph_matching_networks), ICML 2019
-*   [REGAL: Transfer Learning for Fast Optimization of Computation Graphs](regal)
-*   [Deep Ensembles: A Loss Landscape Perspective](ensemble_loss_landscape)
-*   [Powerpropagation](powerpropagation)
-*   [Physics Inspired Models](physics_inspired_models)
+## Architecture
 
+```
+256³ patch → [random 96³ crop pair, overlap ≥ 0.4] → augment independently
+                                                          ↓
+                                              ┌──── view 1 ────┐   ┌──── view 2 ────┐
+                                              │                │   │                │
+                                          Online net       Target net (EMA)
+                                              │                │   │                │
+                                          Encoder f_θ      Encoder f_ξ
+                                          (3D U-Net         (3D U-Net
+                                          contracting)      contracting)
+                                              │                │
+                                          GAP → 320-d      GAP → 320-d
+                                              │                │
+                                          Projector g_θ    Projector g_ξ
+                                          (MLP 320→2048→256) (MLP, same arch)
+                                              │                │
+                                          Predictor q_θ       ✗  (asymmetric)
+                                          (MLP 256→2048→256)
+                                              │                │
+                                              └──── L2 loss ───┘
+                                                (symmetrized)
+```
 
+**Encoder:** 5-level 3D U-Net contracting path `[32, 64, 128, 256, 320]` channels with residual blocks, InstanceNorm3d, LeakyReLU. After global average pooling the bottleneck gives a 320-dim representation.
 
-## Disclaimer
+**Projector/Predictor:** 2-layer MLPs with BatchNorm1d + ReLU (matching paper's depth-2 default from Table 14). The predictor only exists on the online branch — this asymmetry is what prevents collapse.
 
-*This is not an official Google product.*
+**Target network:** exponential moving average of the online network, with a cosine schedule that ramps τ from 0.99 → 1.0 over training.
+
+**Param counts (real config):**
+
+| Component | Params |
+|-----------|--------|
+| Online network (encoder + projector + predictor) | ~10.9M |
+| Target network (encoder + projector) | ~9.8M |
+| Segmentation U-Net (encoder + decoder) | ~16.8M |
+
+## Setup
+
+Requires [pixi](https://pixi.sh). The `pixi.toml` lives in the repo root (`deepmind-research/`).
+
+```bash
+cd deepmind-research/
+
+# GPU environment (cluster with CUDA 12+)
+pixi install
+
+# CPU-only environment (local dev, macOS)
+pixi install -e cpu
+
+# Dev environment (GPU + ipython + tensorboard)
+pixi install -e dev
+```
+
+Or without pixi — just install the deps manually:
+
+```bash
+pip install torch blosc2 numpy scipy
+```
+
+## Quick start
+
+```bash
+# 1. Verify everything works (synthetic data, no GPU, ~5 seconds)
+pixi run smoke
+
+# 2. Run unit tests on network shapes / gradient flow
+pixi run test
+
+# 3. Pretrain on your data
+pixi run pretrain
+
+# 4. Fine-tune from checkpoint
+pixi run finetune
+```
+
+## CLI reference
+
+### Pretraining
+
+```
+python -m byol3d.byol_pretrain_3d [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | `smoke` | Config preset: `full` (cluster) or `smoke` (local test) |
+| `--epochs` | 300 (full) / 2 (smoke) | Number of training epochs |
+| `--batch-size` | 4 (full) / 2 (smoke) | Per-GPU batch size |
+| `--data-dir` | see config | Path to directory of `.b2nd` or `.npy` patch files |
+| `--save-dir` | `/tmp/byol3d_checkpoints` | Where to save checkpoints |
+
+**Examples:**
+
+```bash
+# Smoke test — synthetic data, tiny model, 4 steps
+python -m byol3d.byol_pretrain_3d --config smoke
+
+# Full training with defaults (300 epochs, batch 4)
+python -m byol3d.byol_pretrain_3d --config full \
+    --data-dir /nfs/khan/trainees/apooladi/abeta/nnssl_data/8/nnssl_data/preprocessed
+
+# Override everything
+python -m byol3d.byol_pretrain_3d --config full \
+    --epochs 500 \
+    --batch-size 16 \
+    --data-dir /path/to/my/patches \
+    --save-dir ./my_checkpoints
+
+# Short run to verify GPU training works
+python -m byol3d.byol_pretrain_3d --config full \
+    --epochs 5 \
+    --batch-size 2 \
+    --data-dir /path/to/patches \
+    --save-dir /tmp/test_run
+```
+
+The `--config full` preset loads defaults from `byol3d/configs/lightsheet_3d.py`. Any flag you pass overrides the corresponding config value. If you don't pass `--data-dir`, it uses the hardcoded NFS path in the config.
+
+### Fine-tuning
+
+```
+python -m byol3d.finetune_segmentation [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint` | None | Path to BYOL pretraining `.pt` file. If omitted, trains from scratch. |
+| `--data-dir` | None | Path to labeled data (not yet wired — see below) |
+| `--freeze-encoder` | False | If set, freezes encoder weights (linear probe / decoder-only training) |
+| `--epochs` | 100 | Number of fine-tuning epochs |
+| `--batch-size` | 2 | Per-GPU batch size |
+| `--lr` | 1e-3 | Base learning rate |
+
+**Examples:**
+
+```bash
+# Fine-tune with pretrained encoder (full fine-tuning)
+python -m byol3d.finetune_segmentation \
+    --checkpoint ./checkpoints/byol3d_pretrain.pt \
+    --epochs 200 \
+    --lr 5e-4
+
+# Linear probe: freeze encoder, only train decoder
+python -m byol3d.finetune_segmentation \
+    --checkpoint ./checkpoints/byol3d_pretrain.pt \
+    --freeze-encoder \
+    --epochs 100
+
+# Train from scratch (no pretraining, baseline comparison)
+python -m byol3d.finetune_segmentation \
+    --epochs 200 \
+    --batch-size 2
+```
+
+When `--freeze-encoder` is off (default), the encoder trains with 0.1× the base learning rate (differential LR) while the decoder trains at full LR. This is a standard fine-tuning strategy that preserves pretrained features.
+
+### Pixi tasks
+
+All tasks defined in `pixi.toml`:
+
+| Task | What it does |
+|------|--------------|
+| `pixi run smoke` | Smoke test: synthetic data, no GPU, ~5 sec |
+| `pixi run test` | Network unit tests (shapes, gradients, EMA, loss) |
+| `pixi run pretrain` | Full pretraining: batch=16, 300 epochs |
+| `pixi run pretrain-short` | Shorter pretraining: batch=16, 100 epochs |
+| `pixi run finetune` | Seg fine-tuning from `./checkpoints/byol3d_pretrain.pt` |
+| `pixi run finetune-frozen` | Same but with frozen encoder |
+
+To bypass pixi tasks and pass your own flags directly:
+
+```bash
+pixi run -- python -m byol3d.byol_pretrain_3d --config full --batch-size 32 --epochs 1000
+```
+
+## Config
+
+All hyperparameters live in `byol3d/configs/lightsheet_3d.py`. The `get_config()` function returns a dict. CLI flags override values in this dict at runtime.
+
+If you want to change something that doesn't have a CLI flag (e.g. encoder depth, projector dims, augmentation params), edit the config file directly:
+
+```python
+# byol3d/configs/lightsheet_3d.py
+
+# Change encoder to 4 levels instead of 5
+encoder=dict(
+    in_channels=1,
+    base_channels=32,
+    num_levels=4,        # was 5
+    channels=None,
+    use_residuals=True,
+),
+
+# Smaller projector
+projector=dict(
+    hidden_dim=1024,     # was 2048
+    output_dim=128,      # was 256
+),
+```
+
+Augmentation parameters are in `byol3d/utils/augmentations_3d.py` in the `augment_config` dict at the top of the file. The asymmetry between view1 and view2 (blur probability 0.5 vs 0.1) matches the paper.
+
+## Data format
+
+The dataset loader expects a flat directory of 3D volumes as either:
+
+- **`.b2nd`** files (blosc2 compressed, from nnssl pipeline) — preferred, supports partial decompression
+- **`.npy`** files (numpy arrays) — fallback
+
+Each file should be a single 3D volume (e.g. 256×256×256). The loader handles normalization to [0, 1], crop extraction, and augmentation automatically.
+
+The data directory is set via `--data-dir` or hardcoded in the config. Currently pointing to:
+
+```
+/nfs/khan/trainees/apooladi/abeta/nnssl_data/8/nnssl_data/preprocessed
+```
+
+## VRAM estimates
+
+| Batch size | Crop size | Approx. VRAM | GPU |
+|------------|-----------|-------------|-----|
+| 2 | 96³ | ~8 GB | V100 (16 GB) ✓ |
+| 4 | 96³ | ~12 GB | V100 (32 GB) ✓ |
+| 8 | 96³ | ~18 GB | A100 (40 GB) ✓ |
+| 16 | 96³ | ~28 GB | A100 (80 GB) ✓ |
+| 32 | 96³ | ~50 GB | A100 (80 GB), tight |
+
+If you OOM at batch 16, try gradient accumulation (not yet implemented — accumulate gradients over N forward passes before stepping) or drop to 80³ crops.
+
+## Checkpoints
+
+Pretraining saves checkpoints containing:
+
+```python
+{
+    'epoch': int,
+    'global_step': int,
+    'online_state_dict': ...,     # full online network (encoder + projector + predictor)
+    'target_state_dict': ...,     # full target network
+    'encoder_state_dict': ...,    # just the encoder (for fine-tuning)
+    'optimizer_state_dict': ...,  # (intermediate checkpoints only)
+    'config': dict,               # config used for this run
+}
+```
+
+The fine-tuning script loads `encoder_state_dict` from the checkpoint and attaches a fresh decoder.
+
+## Project structure
+
+```
+deepmind-research/
+├── pixi.toml                         # pixi workspace config
+├── .gitignore
+├── byol/                             # original DeepMind JAX repo (untouched)
+│
+└── byol3d/                           # 3D PyTorch reimplementation
+    ├── __init__.py
+    ├── byol_pretrain_3d.py           # pretraining entry point + training loop
+    ├── finetune_segmentation.py      # segmentation fine-tuning entry point
+    ├── test_networks.py              # unit tests for all network components
+    ├── configs/
+    │   ├── __init__.py
+    │   └── lightsheet_3d.py          # all hyperparameters + presets
+    └── utils/
+        ├── __init__.py
+        ├── networks_3d.py            # encoder, projector, predictor, BYOL wrapper, seg decoder
+        ├── augmentations_3d.py       # 3D augmentation pipeline + crop extraction
+        └── dataset_blosc2.py         # blosc2/npy data loading + DataLoader factory
+```
+
+## TODO
+
+- [ ] **Wire labeled DataLoader into `finetune_segmentation.py`** — the training loop has a placeholder with random tensors. Replace the `# ---- REPLACE THIS ----` section with your real `(image, mask)` DataLoader.
+- [ ] **Multi-GPU / DDP** — currently single-GPU. For batch 16+ across multiple GPUs, wrap with `torch.nn.parallel.DistributedDataParallel`.
+- [ ] **Gradient accumulation** — for effective batch sizes > physical batch size.
+- [ ] **Mixed precision (AMP)** — `torch.cuda.amp` would roughly halve VRAM usage.
+- [ ] **Wandb / tensorboard logging** — currently prints to stdout only.
+- [ ] **k-NN evaluation during pretraining** — track representation quality without fine-tuning.
+
+## References
+
+- Grill, J.-B., et al. "Bootstrap Your Own Latent: A New Approach to Self-Supervised Learning." NeurIPS 2020. [arXiv:2006.07733](https://arxiv.org/abs/2006.07733)
+- Original implementation: [deepmind-research/byol](https://github.com/deepmind/deepmind-research/tree/master/byol)

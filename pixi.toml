@@ -1,0 +1,89 @@
+[workspace]
+name = "byol3d"
+version = "0.1.0"
+description = "BYOL self-supervised pretraining for 3D lightsheet Aβ segmentation"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+# ─────────────────────────────────────────────────────────
+# Common dependencies (both CPU and GPU environments)
+# ─────────────────────────────────────────────────────────
+[dependencies]
+python = ">=3.10,<3.13"
+numpy = ">=1.24"
+scipy = ">=1.10"
+
+# blosc2 for reading nnssl-preprocessed patches
+[pypi-dependencies]
+blosc2 = ">=2.5"
+
+# ─────────────────────────────────────────────────────────
+# GPU feature: CUDA-enabled PyTorch from conda-forge
+# ─────────────────────────────────────────────────────────
+[feature.gpu.system-requirements]
+cuda = "12.0"
+
+[feature.gpu.dependencies]
+pytorch-gpu = ">=2.2"
+cuda-version = "12.*"
+
+# ─────────────────────────────────────────────────────────
+# CPU feature: CPU-only PyTorch (for local dev / macOS)
+# ─────────────────────────────────────────────────────────
+[feature.cpu.dependencies]
+pytorch-cpu = ">=2.2"
+
+# ─────────────────────────────────────────────────────────
+# Dev tools (optional feature)
+# ─────────────────────────────────────────────────────────
+[feature.dev.dependencies]
+ipython = ">=8"
+tensorboard = ">=2.14"
+
+# ─────────────────────────────────────────────────────────
+# Environments
+# ─────────────────────────────────────────────────────────
+[environments]
+default = ["gpu"]
+cpu = ["cpu"]
+dev = ["gpu", "dev"]
+
+# ─────────────────────────────────────────────────────────
+# Tasks
+# ─────────────────────────────────────────────────────────
+[tasks]
+
+# Smoke test — runs on CPU, synthetic data, 4 steps. 
+# Use this to verify everything is wired up correctly.
+smoke = { cmd = "python -m byol3d.byol_pretrain_3d --config smoke", description = "Run smoke test (synthetic data, no GPU needed)" }
+
+# Unit tests for networks module
+test = { cmd = "python byol3d/test_networks.py", description = "Run network architecture unit tests" }
+
+# ── Pretraining ──────────────────────────────────────────
+# Default: 300 epochs, batch_size=16, reads from NFS blosc2 data
+pretrain = { cmd = """python -m byol3d.byol_pretrain_3d \
+    --config full \
+    --batch-size 16 \
+    --data-dir /nfs/khan/trainees/apooladi/abeta/nnssl_data/8/nnssl_data/preprocessed \
+    --save-dir ./checkpoints""", description = "BYOL pretraining (batch=16, 300 epochs)" }
+
+# Override epochs from CLI:  pixi run pretrain-short
+pretrain-short = { cmd = """python -m byol3d.byol_pretrain_3d \
+    --config full \
+    --batch-size 16 \
+    --epochs 100 \
+    --data-dir /nfs/khan/trainees/apooladi/abeta/nnssl_data/8/nnssl_data/preprocessed \
+    --save-dir ./checkpoints""", description = "Short pretraining (100 epochs)" }
+
+# ── Fine-tuning ──────────────────────────────────────────
+finetune = { cmd = """python -m byol3d.finetune_segmentation \
+    --checkpoint ./checkpoints/byol3d_pretrain.pt \
+    --batch-size 2 \
+    --epochs 100""", description = "Segmentation fine-tuning from BYOL checkpoint" }
+
+finetune-frozen = { cmd = """python -m byol3d.finetune_segmentation \
+    --checkpoint ./checkpoints/byol3d_pretrain.pt \
+    --freeze-encoder \
+    --batch-size 2 \
+    --epochs 100""", description = "Fine-tuning with frozen encoder (linear probe)" }
