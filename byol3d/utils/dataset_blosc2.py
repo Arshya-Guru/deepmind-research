@@ -306,6 +306,37 @@ class LightsheetBYOLDataset(Dataset):
         except (OSError, Exception):
             pass  # cache full, permissions, etc. — just skip
 
+    def _read_full_and_cache(
+        self, path: Path, cache_path: Path,
+        pos1: Tuple[int, ...], pos2: Tuple[int, ...]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Read full volume, extract crops, and save cache in one pass.
+
+        On the first epoch when caching is enabled, this does 1 full read
+        instead of 2 partial reads + 1 full read for caching (3x I/O).
+        """
+        arr = blosc2.open(str(path), mode='r')
+        vol = np.asarray(arr[:], dtype=np.float32)
+
+        # Squeeze to 3D
+        while vol.ndim > 3 and vol.shape[0] == 1:
+            vol = vol.squeeze(0)
+
+        # Extract crops from the in-memory volume
+        c = self.crop_size
+        d1, h1, w1 = pos1
+        d2, h2, w2 = pos2
+        crop1 = vol[d1:d1+c, h1:h1+c, w1:w1+c].copy()
+        crop2 = vol[d2:d2+c, h2:h2+c, w2:w2+c].copy()
+
+        # Save full volume to cache (async-ish: fire and forget)
+        try:
+            np.save(str(cache_path), vol)
+        except (OSError, Exception):
+            pass  # disk full, permissions — skip silently
+
+        return crop1, crop2
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Load a volume and return two augmented crop views.
 
@@ -363,10 +394,14 @@ class LightsheetBYOLDataset(Dataset):
         if use_cache:
             crop1, crop2 = self._read_crops_cached(cache_path, pos1, pos2)
         elif path.suffix == '.b2nd' and HAS_BLOSC2:
-            crop1, crop2 = self._read_crops_blosc2(path, pos1, pos2)
-            # Trigger cache save for next epoch (full volume, one-time cost)
             if cache_path is not None and not cache_path.exists():
-                self._cache_full_volume(path, cache_path)
+                # First epoch with caching: read FULL volume once, extract
+                # crops, then save cache. This is 1 full read instead of
+                # 2 partial reads + 1 full read for caching.
+                crop1, crop2 = self._read_full_and_cache(path, cache_path, pos1, pos2)
+            else:
+                # No caching: partial reads only (fast, ~11% of volume)
+                crop1, crop2 = self._read_crops_blosc2(path, pos1, pos2)
         else:
             # .npy fallback: load full and slice
             vol = np.load(str(path)).astype(np.float32)

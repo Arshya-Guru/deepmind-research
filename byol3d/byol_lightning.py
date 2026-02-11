@@ -298,6 +298,15 @@ class BYOLCheckpointCallback(pl.Callback):
 
 def main():
     parser = argparse.ArgumentParser(description='BYOL 3D Lightning Trainer')
+
+    # Suppress harmless DDP stream mismatch warning
+    import warnings
+    warnings.filterwarnings('ignore', message='.*AccumulateGrad.*stream.*')
+    try:
+        torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+    except AttributeError:
+        pass  # older PyTorch versions don't have this
+
     parser.add_argument('--config', type=str, default='full',
                         choices=['full', 'smoke'],
                         help='Config preset (default: full)')
@@ -318,6 +327,10 @@ def main():
     parser.add_argument('--precision', type=str, default='32',
                         choices=['32', '16-mixed', 'bf16-mixed'],
                         help='Training precision (default: 32)')
+    parser.add_argument('--num-samples', type=int, default=None,
+                        help='Override dataset size (auto-detected from data-dir)')
+    parser.add_argument('--num-workers', type=int, default=None,
+                        help='Override num_workers for DataLoader')
     args = parser.parse_args()
 
     # -- Build config --
@@ -329,15 +342,36 @@ def main():
     # -- Apply CLI overrides --
     if args.epochs is not None:
         cfg['num_epochs'] = args.epochs
-        cfg['max_steps'] = args.epochs * cfg['steps_per_epoch']
     if args.batch_size is not None:
         cfg['batch_size'] = args.batch_size
-        cfg['steps_per_epoch'] = 1000 // args.batch_size  # approximate
-        cfg['max_steps'] = cfg['num_epochs'] * cfg['steps_per_epoch']
     if args.data_dir is not None:
         cfg['data']['data_dir'] = args.data_dir
     if args.save_dir is not None:
         cfg['checkpoint']['save_dir'] = args.save_dir
+
+    # -- Auto-detect dataset size for accurate max_steps --
+    # With DDP, each GPU sees dataset_size // num_devices samples per epoch.
+    # We count files once here so the progress bar and LR schedule are correct.
+    data_dir = cfg['data'].get('data_dir')
+    if data_dir is not None and args.num_samples is None:
+        from pathlib import Path
+        n_files = len(list(Path(data_dir).rglob('*.b2nd')))
+        if n_files == 0:
+            n_files = len(list(Path(data_dir).rglob('*.npy')))
+        if n_files > 0:
+            cfg['num_samples'] = n_files
+            print(f'Auto-detected {n_files} files in {data_dir}')
+    if args.num_samples is not None:
+        cfg['num_samples'] = args.num_samples
+
+    # Recompute steps with actual sample count and device count
+    num_devices_for_calc = args.devices or (
+        torch.cuda.device_count() if torch.cuda.is_available() else 1)
+    samples_per_gpu = cfg.get('num_samples', 1000) // num_devices_for_calc
+    cfg['steps_per_epoch'] = max(samples_per_gpu // cfg['batch_size'], 1)
+    cfg['max_steps'] = cfg['num_epochs'] * cfg['steps_per_epoch']
+    cfg['lr_schedule']['warmup_steps'] = cfg['lr_schedule'].get(
+        'warmup_epochs', 10) * cfg['steps_per_epoch']
 
     # -- Auto-detect devices --
     if args.devices is not None:
@@ -345,7 +379,15 @@ def main():
     else:
         num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
 
+    # Override num_workers if specified
+    if args.num_workers is not None:
+        cfg['data']['num_workers'] = args.num_workers
+
     accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
+
+    # Use tensor cores on A100/L40S for ~2x matmul speedup
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
 
     # -- Strategy --
     if num_devices > 1:
@@ -380,10 +422,16 @@ def main():
     n_target = sum(p.numel() for p in model.target.parameters())
     print(f'Config: {cfg["num_epochs"]} epochs, batch_size={cfg["batch_size"]} per GPU, '
           f'max_steps={cfg["max_steps"]}')
+    print(f'  steps_per_epoch={cfg["steps_per_epoch"]}, '
+          f'warmup_steps={cfg["lr_schedule"]["warmup_steps"]}')
     print(f'Online: {n_online:,} params | Target: {n_target:,} params')
     print(f'Devices: {num_devices} x {accelerator}')
     if num_devices > 1:
         print(f'Effective batch size: {cfg["batch_size"] * num_devices}')
+    print(f'Data workers: {cfg["data"]["num_workers"]} per process')
+    if cfg['data'].get('cache_dir'):
+        print(f'Cache dir: {cfg["data"]["cache_dir"]} '
+              f'(first epoch slow, subsequent fast)')
 
     # -- Callbacks --
     callbacks = [
