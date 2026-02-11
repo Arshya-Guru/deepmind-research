@@ -34,14 +34,14 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
-from byol3d.configs.lightsheet_3d import get_config, get_smoke_test_config
-from byol3d.utils.networks_3d import (
+from byol.configs.lightsheet_3d import get_config, get_smoke_test_config
+from byol.utils.networks_3d import (
     create_byol_pair,
     regression_loss,
     update_target_ema,
     cosine_ema_schedule,
 )
-from byol3d.utils.dataset_blosc2 import create_byol_dataloader
+from byol.utils.dataset_blosc2 import create_byol_dataloader
 
 
 # ---------------------------------------------------------------------------
@@ -90,8 +90,8 @@ def train_step(
     Returns:
         dict of logged scalars
     """
-    view1 = view1.to(device)
-    view2 = view2.to(device)
+    view1 = view1.to(device, non_blocking=True)
+    view2 = view2.to(device, non_blocking=True)
 
     # -- Update learning rate --
     lr = cosine_lr_schedule(step, max_steps, base_lr, warmup_steps)
@@ -207,6 +207,7 @@ def pretrain(cfg: dict, device: Optional[torch.device] = None):
         synthetic=use_synthetic,
         synthetic_num_samples=max(cfg['max_steps'] * cfg['batch_size'], 100),
         synthetic_volume_size=cfg['data'].get('volume_size', 32),
+        cache_dir=cfg['data'].get('cache_dir', None),
     )
 
     # -- Checkpoint dir --
@@ -226,11 +227,15 @@ def pretrain(cfg: dict, device: Optional[torch.device] = None):
         epoch_loss = 0.0
         epoch_steps = 0
         t0 = time.time()
+        t_data_start = time.time()
 
         for batch in loader:
+            t_data = time.time() - t_data_start  # time spent waiting for data
+
             if global_step >= cfg['max_steps']:
                 break
 
+            t_compute_start = time.time()
             logs = train_step(
                 online=online,
                 target=target,
@@ -244,6 +249,7 @@ def pretrain(cfg: dict, device: Optional[torch.device] = None):
                 warmup_steps=cfg['lr_schedule']['warmup_steps'],
                 device=device,
             )
+            t_compute = time.time() - t_compute_start
 
             epoch_loss += logs['loss']
             epoch_steps += 1
@@ -253,7 +259,10 @@ def pretrain(cfg: dict, device: Optional[torch.device] = None):
                 print(f"  step {global_step:>6d}/{cfg['max_steps']} | "
                       f"loss={logs['loss']:.4f} | "
                       f"lr={logs['lr']:.2e} | "
-                      f"tau={logs['tau']:.6f}")
+                      f"tau={logs['tau']:.6f} | "
+                      f"data={t_data:.2f}s gpu={t_compute:.2f}s")
+
+            t_data_start = time.time()  # start timing next data load
 
         if global_step >= cfg['max_steps']:
             break

@@ -49,8 +49,9 @@ def get_config(num_epochs: int = 300, batch_size: int = 4,
             crop_size=96,
             volume_size=256,   # source patch size
             min_overlap=0.4,
-            num_workers=4,
+            num_workers=8,
             pin_memory=True,
+            cache_dir='/tmp/byol_cache',   # local SSD cache for NFS volumes
             in_channels=1,
         ),
 

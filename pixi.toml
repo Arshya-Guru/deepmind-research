@@ -14,8 +14,10 @@ numpy = ">=1.24"
 scipy = ">=1.10"
 
 # blosc2 for reading nnssl-preprocessed patches
+# lightning for multi-GPU DDP training
 [pypi-dependencies]
 blosc2 = ">=2.5"
+lightning = ">=2.2"
 
 # ─────────────────────────────────────────────────────────
 # GPU feature: CUDA-enabled PyTorch from conda-forge
@@ -87,3 +89,29 @@ finetune-frozen = { cmd = """python -m byol3d.finetune_segmentation \
     --freeze-encoder \
     --batch-size 2 \
     --epochs 100""", description = "Fine-tuning with frozen encoder (linear probe)" }
+
+# ── Lightning multi-GPU pretraining ──────────────────────
+smoke-lightning = { cmd = "python -m byol3d.byol_lightning --config smoke", description = "Lightning smoke test (CPU, synthetic data)" }
+
+pretrain-lightning = { cmd = """python -m byol3d.byol_lightning \
+    --config full \
+    --batch-size 16 \
+    --data-dir /nfs/khan/trainees/apooladi/abeta/nnssl_data/8/nnssl_data/preprocessed \
+    --save-dir ./checkpoints \
+    --sync-batchnorm""", description = "Lightning BYOL pretraining (auto-detect GPUs)" }
+
+pretrain-lightning-2gpu = { cmd = """python -m byol3d.byol_lightning \
+    --config full \
+    --batch-size 8 \
+    --devices 2 \
+    --data-dir /nfs/khan/trainees/apooladi/abeta/nnssl_data/8/nnssl_data/preprocessed \
+    --save-dir ./checkpoints \
+    --sync-batchnorm""", description = "Lightning BYOL pretraining (2 GPUs)" }
+
+pretrain-lightning-4gpu = { cmd = """python -m byol3d.byol_lightning \
+    --config full \
+    --batch-size 4 \
+    --devices 4 \
+    --data-dir /nfs/khan/trainees/apooladi/abeta/nnssl_data/8/nnssl_data/preprocessed \
+    --save-dir ./checkpoints \
+    --sync-batchnorm""", description = "Lightning BYOL pretraining (4 GPUs)" }
