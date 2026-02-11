@@ -6,132 +6,117 @@ Reimplemented in PyTorch from [DeepMind's original JAX/Haiku codebase](https://g
 
 ## Why BYOL over SimCLR
 
-- **No negative pairs** → robust at small batch sizes (2–16). SimCLR performance collapses below batch 256.
-- **Augmentation tolerant** → BYOL degrades ~3 pts with fewer augmentations vs ~10 pts for SimCLR (paper Table 5).
-- **3D memory constraints** → 96³ crops × batch 16 already pushes 20–30 GB VRAM. BYOL doesn't need the massive batches SimCLR requires.
-
-## Architecture
-
-```
-256³ patch → [random 96³ crop pair, overlap ≥ 0.4] → augment independently
-                                                          ↓
-                                              ┌──── view 1 ────┐   ┌──── view 2 ────┐
-                                              │                │   │                │
-                                          Online net       Target net (EMA)
-                                              │                │   │                │
-                                          Encoder f_θ      Encoder f_ξ
-                                          (3D U-Net         (3D U-Net
-                                          contracting)      contracting)
-                                              │                │
-                                          GAP → 320-d      GAP → 320-d
-                                              │                │
-                                          Projector g_θ    Projector g_ξ
-                                          (MLP 320→2048→256) (MLP, same arch)
-                                              │                │
-                                          Predictor q_θ       ✗  (asymmetric)
-                                          (MLP 256→2048→256)
-                                              │                │
-                                              └──── L2 loss ───┘
-                                                (symmetrized)
-```
-
-**Encoder:** 5-level 3D U-Net contracting path `[32, 64, 128, 256, 320]` channels with residual blocks, InstanceNorm3d, LeakyReLU. After global average pooling the bottleneck gives a 320-dim representation.
-
-**Projector/Predictor:** 2-layer MLPs with BatchNorm1d + ReLU (matching paper's depth-2 default from Table 14). The predictor only exists on the online branch — this asymmetry is what prevents collapse.
-
-**Target network:** exponential moving average of the online network, with a cosine schedule that ramps τ from 0.99 → 1.0 over training.
-
-**Param counts (real config):**
-
-| Component | Params |
-|-----------|--------|
-| Online network (encoder + projector + predictor) | ~10.9M |
-| Target network (encoder + projector) | ~9.8M |
-| Segmentation U-Net (encoder + decoder) | ~16.8M |
-
-## Setup
-
-Requires [pixi](https://pixi.sh). The `pixi.toml` lives in the repo root (`deepmind-research/`).
-
-```bash
-cd deepmind-research/
-
-# GPU environment (cluster with CUDA 12+)
-pixi install
-
-# CPU-only environment (local dev, macOS)
-pixi install -e cpu
-
-# Dev environment (GPU + ipython + tensorboard)
-pixi install -e dev
-```
-
-Or without pixi — just install the deps manually:
-
-```bash
-pip install torch blosc2 numpy scipy
-```
+- **No negative pairs** → robust at small batch sizes (2–16). SimCLR degrades catastrophically below batch 256.
+- **Augmentation-tolerant** → dropping augmentations costs ~3pt for BYOL vs ~10pt for SimCLR (paper Table 16). Critical for single-channel microscopy where color jittering/solarization don't apply.
+- **EMA target network** → more stable training signal than contrastive methods.
 
 ## Quick start
 
 ```bash
-# 1. Verify everything works (synthetic data, no GPU, ~5 seconds)
+# Install
+pixi install
+
+# Smoke test (CPU, ~5 sec)
 pixi run smoke
 
-# 2. Run unit tests on network shapes / gradient flow
+# Unit tests
 pixi run test
-
-# 3. Pretrain on your data
-pixi run pretrain
-
-# 4. Fine-tune from checkpoint
-pixi run finetune
 ```
 
-## CLI reference
+## Pretraining
 
-### Pretraining
+### CLI reference
 
 ```
-python -m byol3d.byol_pretrain_3d [OPTIONS]
+python -m byol3d.byol_lightning --config {full|smoke} [OPTIONS]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--config` | `smoke` | Config preset: `full` (cluster) or `smoke` (local test) |
-| `--epochs` | 300 (full) / 2 (smoke) | Number of training epochs |
-| `--batch-size` | 4 (full) / 2 (smoke) | Per-GPU batch size |
-| `--data-dir` | see config | Path to directory of `.b2nd` or `.npy` patch files |
-| `--save-dir` | `/tmp/byol3d_checkpoints` | Where to save checkpoints |
+| `--config` | required | `full` for real training, `smoke` for CPU test |
+| `--epochs` | 300 | Number of training epochs |
+| `--batch-size` | 8 | Per-GPU batch size |
+| `--data-dir` | config default | Path to preprocessed `.b2nd` patches |
+| `--save-dir` | config default | Checkpoint output directory |
+| `--num-workers` | 8 | DataLoader workers per process |
+| `--precision` | `32` | `32`, `16-mixed`, or `bf16-mixed` |
+| `--devices` | auto | Number of GPUs (auto-detected) |
+| `--strategy` | `auto` | `auto`, `ddp`, `ddp_find_unused_parameters_true` |
+| `--sync-batchnorm` | off | Convert MLP head BatchNorm to SyncBatchNorm (multi-GPU) |
 
-**Examples:**
+### Example: single GPU, batch size 16
+
+Uses one GPU with per-GPU batch 16 → effective batch size 16. Good for quick iteration or smaller GPU memory (e.g. single A100-40GB).
 
 ```bash
-# Smoke test — synthetic data, tiny model, 4 steps
-python -m byol3d.byol_pretrain_3d --config smoke
+salloc --time=2-00:00 --cpus-per-task=16 --mem=128000 --gres=gpu:1
 
-# Full training with defaults (300 epochs, batch 4)
-python -m byol3d.byol_pretrain_3d --config full \
-    --data-dir /nfs/khan/trainees/apooladi/abeta/nnssl_data/8/nnssl_data/preprocessed
-
-# Override everything
-python -m byol3d.byol_pretrain_3d --config full \
-    --epochs 500 \
-    --batch-size 16 \
-    --data-dir /path/to/my/patches \
-    --save-dir ./my_checkpoints
-
-# Short run to verify GPU training works
-python -m byol3d.byol_pretrain_3d --config full \
-    --epochs 5 \
-    --batch-size 2 \
-    --data-dir /path/to/patches \
-    --save-dir /tmp/test_run
+pixi shell
+python -m byol3d.byol_lightning --config full \
+    --epochs 300 --batch-size 16 \
+    --data-dir /nfs/khan/trainees/apooladi/abeta/nnssl_data/8/nnssl_data/preprocessed \
+    --save-dir ../byol_work/8/ \
+    --num-workers 8 --precision bf16-mixed --devices 1
 ```
 
-The `--config full` preset loads defaults from `byol3d/configs/lightsheet_3d.py`. Any flag you pass overrides the corresponding config value. If you don't pass `--data-dir`, it uses the hardcoded NFS path in the config.
+**What this does:**
+- 10,000 files / batch 16 = **625 steps per epoch**
+- bf16-mixed halves VRAM usage → batch 16 fits comfortably on one A100
+- 8 workers feed data from NFS, OS page cache makes epoch 2+ ~5x faster
+- Epoch 1: ~1hr (cold NFS reads). Epochs 2+: ~10-15 min each (page cache warm)
+- **~3 days total** for 300 epochs
 
-### Fine-tuning
+### Example: 2 GPUs, batch size 64
+
+Uses both A100s with per-GPU batch 32 → effective batch size 64. Lightning auto-detects 2 GPUs and uses DDP (DistributedDataParallel). Gradients are allreduced across GPUs so the optimizer sees the full batch.
+
+```bash
+salloc --time=2-00:00 --cpus-per-task=32 --mem=256000 --gres=gpu:2
+
+pixi shell
+python -m byol3d.byol_lightning --config full \
+    --epochs 300 --batch-size 32 \
+    --data-dir /nfs/khan/trainees/apooladi/abeta/nnssl_data/8/nnssl_data/preprocessed \
+    --save-dir ../byol_work/8/ \
+    --num-workers 16 --precision bf16-mixed
+```
+
+**What this does:**
+- Lightning auto-detects 2 GPUs → DDP with DistributedSampler
+- Each GPU processes 32 samples, effective batch = 32 × 2 = **64**
+- 10,000 files / 64 = **~156 steps per epoch** (much faster than single-GPU)
+- 16 workers per process (32 total across both ranks)
+- DistributedSampler splits files: each GPU sees 5,000 unique files per epoch
+- BatchNorm in projector/predictor computes stats per-GPU (32 samples each — plenty for stable BN)
+- **~1-1.5 days total** for 300 epochs
+
+### VRAM estimates (per GPU)
+
+| Per-GPU Batch | Precision | Approx. VRAM | Fits on |
+|---------------|-----------|--------------|---------|
+| 8 | bf16-mixed | ~18 GB | A100-40GB ✓ |
+| 16 | bf16-mixed | ~28 GB | A100-40GB ✓ |
+| 32 | bf16-mixed | ~38 GB | A100-40GB (tight), A100-80GB ✓ |
+| 64 | bf16-mixed | ~60 GB | A100-80GB only |
+
+If batch 32 OOMs on A100-40GB, drop to `--batch-size 24` or `--batch-size 16`.
+
+### Pixi tasks
+
+| Task | What it does |
+|------|--------------|
+| `pixi run smoke` | Smoke test: synthetic data, no GPU, ~5 sec |
+| `pixi run test` | Network unit tests (shapes, gradients, EMA, loss) |
+| `pixi run pretrain` | Full pretraining: batch 16, 300 epochs |
+| `pixi run pretrain-short` | Shorter pretraining: batch 16, 100 epochs |
+
+To bypass pixi tasks and pass your own flags:
+
+```bash
+pixi run -- python -m byol3d.byol_lightning --config full --batch-size 32 --epochs 500
+```
+
+## Fine-tuning
 
 ```
 python -m byol3d.finetune_segmentation [OPTIONS]
@@ -139,158 +124,104 @@ python -m byol3d.finetune_segmentation [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--checkpoint` | None | Path to BYOL pretraining `.pt` file. If omitted, trains from scratch. |
-| `--data-dir` | None | Path to labeled data (not yet wired — see below) |
-| `--freeze-encoder` | False | If set, freezes encoder weights (linear probe / decoder-only training) |
-| `--epochs` | 100 | Number of fine-tuning epochs |
+| `--checkpoint` | None | Path to BYOL `.pt` checkpoint. Omit to train from scratch. |
+| `--data-dir` | None | Path to labeled segmentation data |
+| `--freeze-encoder` | off | Freeze encoder, train decoder only (linear probe) |
+| `--epochs` | 100 | Fine-tuning epochs |
 | `--batch-size` | 2 | Per-GPU batch size |
 | `--lr` | 1e-3 | Base learning rate |
 
 **Examples:**
 
 ```bash
-# Fine-tune with pretrained encoder (full fine-tuning)
+# Full fine-tuning with pretrained encoder
 python -m byol3d.finetune_segmentation \
-    --checkpoint ./checkpoints/byol3d_pretrain.pt \
-    --epochs 200 \
-    --lr 5e-4
+    --checkpoint ../byol_work/8/byol3d_pretrain.pt \
+    --epochs 200 --lr 5e-4
 
 # Linear probe: freeze encoder, only train decoder
 python -m byol3d.finetune_segmentation \
-    --checkpoint ./checkpoints/byol3d_pretrain.pt \
-    --freeze-encoder \
-    --epochs 100
+    --checkpoint ../byol_work/8/byol3d_pretrain.pt \
+    --freeze-encoder --epochs 100
 
-# Train from scratch (no pretraining, baseline comparison)
-python -m byol3d.finetune_segmentation \
-    --epochs 200 \
-    --batch-size 2
+# Train from scratch (baseline comparison — no pretraining)
+python -m byol3d.finetune_segmentation --epochs 200 --batch-size 2
 ```
 
-When `--freeze-encoder` is off (default), the encoder trains with 0.1× the base learning rate (differential LR) while the decoder trains at full LR. This is a standard fine-tuning strategy that preserves pretrained features.
-
-### Pixi tasks
-
-All tasks defined in `pixi.toml`:
-
-| Task | What it does |
-|------|--------------|
-| `pixi run smoke` | Smoke test: synthetic data, no GPU, ~5 sec |
-| `pixi run test` | Network unit tests (shapes, gradients, EMA, loss) |
-| `pixi run pretrain` | Full pretraining: batch=16, 300 epochs |
-| `pixi run pretrain-short` | Shorter pretraining: batch=16, 100 epochs |
-| `pixi run finetune` | Seg fine-tuning from `./checkpoints/byol3d_pretrain.pt` |
-| `pixi run finetune-frozen` | Same but with frozen encoder |
-
-To bypass pixi tasks and pass your own flags directly:
-
-```bash
-pixi run -- python -m byol3d.byol_pretrain_3d --config full --batch-size 32 --epochs 1000
-```
+When `--freeze-encoder` is off (default), the encoder trains at 0.1× the base LR while the decoder trains at full LR.
 
 ## Config
 
-All hyperparameters live in `byol3d/configs/lightsheet_3d.py`. The `get_config()` function returns a dict. CLI flags override values in this dict at runtime.
+All hyperparameters live in `byol3d/configs/lightsheet_3d.py`. CLI flags override values at runtime.
 
-If you want to change something that doesn't have a CLI flag (e.g. encoder depth, projector dims, augmentation params), edit the config file directly:
+To change things without CLI flags (encoder depth, projector dims, augmentation params), edit the config directly:
 
 ```python
 # byol3d/configs/lightsheet_3d.py
 
-# Change encoder to 4 levels instead of 5
 encoder=dict(
     in_channels=1,
     base_channels=32,
-    num_levels=4,        # was 5
-    channels=None,
-    use_residuals=True,
+    num_levels=4,        # was 5 — fewer levels = smaller model
 ),
 
-# Smaller projector
 projector=dict(
     hidden_dim=1024,     # was 2048
     output_dim=128,      # was 256
 ),
 ```
 
-Augmentation parameters are in `byol3d/utils/augmentations_3d.py` in the `augment_config` dict at the top of the file. The asymmetry between view1 and view2 (blur probability 0.5 vs 0.1) matches the paper.
+Augmentation parameters are in `byol3d/utils/augmentations_3d.py` in the `augment_config` dict. The asymmetry between view1 and view2 (blur probability 0.5 vs 0.1) matches the paper.
 
-## Data format
-
-The dataset loader expects a flat directory of 3D volumes as either:
-
-- **`.b2nd`** files (blosc2 compressed, from nnssl pipeline) — preferred, supports partial decompression
-- **`.npy`** files (numpy arrays) — fallback
-
-Each file should be a single 3D volume (e.g. 256×256×256). The loader handles normalization to [0, 1], crop extraction, and augmentation automatically.
-
-The data directory is set via `--data-dir` or hardcoded in the config. Currently pointing to:
+## Architecture
 
 ```
-/nfs/khan/trainees/apooladi/abeta/nnssl_data/8/nnssl_data/preprocessed
+Input volume (256³) → random 96³ crop pair (≥40% overlap)
+                          ↓                    ↓
+                      view1_aug            view2_aug
+                          ↓                    ↓
+                  ┌── Online Network ──┐  ┌── Target Network (EMA) ──┐
+                  │  Encoder (U-Net)   │  │  Encoder (U-Net)         │
+                  │  → GAP → Projector │  │  → GAP → Projector      │
+                  │  → Predictor       │  │  (no predictor)          │
+                  └────────────────────┘  └──────────────────────────┘
+                          ↓                    ↓
+                  prediction_1          projection_2 (stop-grad)
+                          ↓                    ↓
+                      BYOL loss = 2 - 2·cos(pred, proj)
+                      (symmetrized: swap views and add)
+
+    After each step: target_params = τ·target + (1-τ)·online
+                     τ follows cosine schedule: 0.99 → 1.0
 ```
 
-## VRAM estimates
+**Collapse prevention:** The predictor is only on the online network (asymmetry). The target sees no gradients (stop-gradient + EMA). This asymmetry is what prevents representation collapse — removing the predictor or making the target trainable causes collapse (paper Table 5).
 
-| Batch size | Crop size | Approx. VRAM | GPU |
-|------------|-----------|-------------|-----|
-| 2 | 96³ | ~8 GB | V100 (16 GB) ✓ |
-| 4 | 96³ | ~12 GB | V100 (32 GB) ✓ |
-| 8 | 96³ | ~18 GB | A100 (40 GB) ✓ |
-| 16 | 96³ | ~28 GB | A100 (80 GB) ✓ |
-| 32 | 96³ | ~50 GB | A100 (80 GB), tight |
+## Checkpoint format
 
-If you OOM at batch 16, try gradient accumulation (not yet implemented — accumulate gradients over N forward passes before stepping) or drop to 80³ crops.
-
-## Checkpoints
-
-Pretraining saves checkpoints containing:
+Saved as `.pt` file containing:
 
 ```python
 {
-    'epoch': int,
-    'global_step': int,
-    'online_state_dict': ...,     # full online network (encoder + projector + predictor)
-    'target_state_dict': ...,     # full target network
-    'encoder_state_dict': ...,    # just the encoder (for fine-tuning)
-    'optimizer_state_dict': ...,  # (intermediate checkpoints only)
-    'config': dict,               # config used for this run
+    'encoder_state_dict': ...,      # for SegmentationUNet3D.from_byol_encoder()
+    'online_state_dict': ...,       # full online network
+    'target_state_dict': ...,       # full target network
+    'optimizer_state_dict': ...,
+    'epoch': ...,
+    'global_step': ...,
 }
 ```
 
-The fine-tuning script loads `encoder_state_dict` from the checkpoint and attaches a fresh decoder.
+## Data format
 
-## Project structure
-
-```
-deepmind-research/
-├── pixi.toml                         # pixi workspace config
-├── .gitignore
-├── byol/                             # original DeepMind JAX repo (untouched)
-│
-└── byol3d/                           # 3D PyTorch reimplementation
-    ├── __init__.py
-    ├── byol_pretrain_3d.py           # pretraining entry point + training loop
-    ├── finetune_segmentation.py      # segmentation fine-tuning entry point
-    ├── test_networks.py              # unit tests for all network components
-    ├── configs/
-    │   ├── __init__.py
-    │   └── lightsheet_3d.py          # all hyperparameters + presets
-    └── utils/
-        ├── __init__.py
-        ├── networks_3d.py            # encoder, projector, predictor, BYOL wrapper, seg decoder
-        ├── augmentations_3d.py       # 3D augmentation pipeline + crop extraction
-        └── dataset_blosc2.py         # blosc2/npy data loading + DataLoader factory
-```
+Expects preprocessed `.b2nd` (blosc2) files from the nnssl pipeline. Each file is a z-scored 3D volume (no additional normalization applied — double-normalizing hurts representations). Files may vary in spatial dimensions; the dataloader reads each file's actual shape and computes valid crop positions accordingly.
 
 ## TODO
 
-- [ ] **Wire labeled DataLoader into `finetune_segmentation.py`** — the training loop has a placeholder with random tensors. Replace the `# ---- REPLACE THIS ----` section with your real `(image, mask)` DataLoader.
-- [ ] **Multi-GPU / DDP** — currently single-GPU. For batch 16+ across multiple GPUs, wrap with `torch.nn.parallel.DistributedDataParallel`.
-- [ ] **Gradient accumulation** — for effective batch sizes > physical batch size.
-- [ ] **Mixed precision (AMP)** — `torch.cuda.amp` would roughly halve VRAM usage.
-- [ ] **Wandb / tensorboard logging** — currently prints to stdout only.
-- [ ] **k-NN evaluation during pretraining** — track representation quality without fine-tuning.
+- [ ] Init-time filtering of undersized patches (files smaller than crop_size on any axis)
+- [ ] Wire labeled DataLoader into `finetune_segmentation.py`
+- [ ] Wandb / tensorboard logging
+- [ ] k-NN evaluation during pretraining
 
 ## References
 

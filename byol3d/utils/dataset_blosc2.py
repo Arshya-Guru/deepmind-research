@@ -1,35 +1,19 @@
 """
 Dataset loader for blosc2-compressed lightsheet patches.
 
-Loads preprocessed 256^3 patches from the nnssl pipeline, extracts
+Loads preprocessed patches from the nnssl pipeline, extracts
 overlap-constrained crop pairs, and applies BYOL augmentations.
 
 Key design decisions informed by nnssl internals:
   - Data is ALREADY z-scored during nnssl preprocessing — NO normalization here.
-    The .b2nd values are the final training values. Double-normalizing (e.g.
-    rescaling to [0,1]) compresses the learned distribution and hurts
-    representation quality.
-  - Blosc2 partial reads: we open a handle (no decompression), compute crop
-    positions from shape metadata, then slice the handle — only the chunks
-    overlapping each 96^3 crop are decompressed. For two 96^3 crops from a
-    256^3 volume this decompresses ~11% of the data instead of 100%.
-  - blosc2.set_nthreads(1) per DataLoader worker to avoid thread contention
-    across multiprocessing workers.
-  - Local SSD cache: first epoch reads from NFS + blosc2, saves decompressed
-    .npy to local disk. Subsequent epochs use numpy mmap for fast random access.
-  - Error handling: corrupted files silently fall back to a random other sample
-    (matches nnssl behavior).
-  - The .pkl sidecar contains spatial metadata only (spacing, bbox, shape) —
-    not needed for training, so we don't load it.
-
-Data flow:
-  1. Scan directory recursively for .b2nd files
-  2. On __getitem__:
-     a. Open blosc2 handle (lazy, no decompression)
-     b. Compute two overlapping 96^3 crop positions from volume shape
-     c. Partial-read each crop region (only relevant chunks decompressed)
-     d. Apply view1/view2 augmentations independently
-  3. Return dict with 'view1' and 'view2' tensors
+  - Blosc2 partial reads: only chunks overlapping each crop are decompressed.
+  - blosc2.set_nthreads(1) per DataLoader worker to avoid thread contention.
+  - mmap_mode='r' on ALL blosc2.open calls so the OS page cache works.
+  - np.array(copy=True) + .clone() on ALL reads to ensure tensors own their
+    memory (prevents "Trying to resize storage that is not resizable").
+  - persistent_workers=False to avoid stale mmap handles across forks.
+  - Single blosc2.open() per sample: shape + crops from one handle.
+  - NO global shape cache — files may have different spatial dimensions.
 """
 
 from __future__ import annotations
@@ -76,10 +60,6 @@ def compute_crop_positions(
 ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
     """Compute two overlapping crop start positions from volume shape.
 
-    This is the data-free counterpart of extract_overlapping_crops() from
-    augmentations_3d.py. It returns positions only, so we can slice a blosc2
-    handle or numpy mmap without loading the full volume.
-
     Args:
         spatial_shape: (D, H, W) of the source volume
         crop_size: spatial size of each crop
@@ -119,14 +99,9 @@ def compute_crop_positions(
 # ---------------------------------------------------------------------------
 
 def _worker_init_fn(worker_id: int) -> None:
-    """Per-worker initialization for DataLoader multiprocessing.
-
-    - Sets blosc2 to single-threaded (avoids thread contention across workers)
-    - Seeds numpy RNG per worker (avoids identical augmentations)
-    """
+    """Per-worker initialization for DataLoader multiprocessing."""
     if HAS_BLOSC2:
         blosc2.set_nthreads(1)
-    # Unique seed per worker per epoch (PyTorch sets base seed per epoch)
     seed = torch.initial_seed() % (2**32)
     np.random.seed(seed + worker_id)
 
@@ -138,22 +113,10 @@ def _worker_init_fn(worker_id: int) -> None:
 class LightsheetBYOLDataset(Dataset):
     """Dataset for BYOL pretraining on blosc2-compressed lightsheet patches.
 
-    Each sample returns two augmented views (crop pairs) from one 256^3 patch.
+    Each sample returns two augmented views (crop pairs) from one patch.
 
     IMPORTANT: The .b2nd data is already z-scored by nnssl preprocessing.
-    No additional normalization is applied. The voxel values in the .b2nd
-    files are the final training values.
-
-    Args:
-        data_dir: path to directory containing .b2nd files
-        crop_size: spatial size of each crop (96 for our 3D U-Net)
-        min_overlap: minimum volumetric overlap fraction between crop pairs
-        view1_aug: augmentation pipeline for view 1
-        view2_aug: augmentation pipeline for view 2
-        file_ext: file extension to search for
-        cache_dir: local SSD directory for caching decompressed volumes.
-            First epoch: read from NFS blosc2, save .npy to cache.
-            Subsequent epochs: numpy mmap from local SSD (~10x faster).
+    No additional normalization is applied.
     """
 
     def __init__(
@@ -161,71 +124,43 @@ class LightsheetBYOLDataset(Dataset):
         data_dir: str,
         crop_size: int = 96,
         min_overlap: float = 0.4,
-        view1_aug: Optional[Augment3D] = None,
-        view2_aug: Optional[Augment3D] = None,
-        file_ext: str = '.b2nd',
         cache_dir: Optional[str] = None,
     ):
         super().__init__()
-        self.data_dir = Path(data_dir)
         self.crop_size = crop_size
         self.min_overlap = min_overlap
-        self.file_ext = file_ext
-
-        # Local SSD cache for decompressed volumes
         self.cache_dir = Path(cache_dir) if cache_dir else None
-        if self.cache_dir:
+
+        if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Default augmentations from our config
-        self.view1_aug = view1_aug or Augment3D(**augment_config['view1'])
-        self.view2_aug = view2_aug or Augment3D(**augment_config['view2'])
-
-        # Discover files — recursive glob for nnssl nested structure:
-        #   preprocessed/Dataset001_Pretrain/nnsslPlans_noresample/
-        #       PatchCollection/1/patch_00000/ses-01/patch_00000.b2nd
-        self.file_paths = sorted(self.data_dir.rglob(f'*{file_ext}'))
+        # Scan for data files
+        data_path = Path(data_dir)
+        self.file_paths: List[Path] = sorted(
+            list(data_path.rglob('*.b2nd')) + list(data_path.rglob('*.npy'))
+        )
         if not self.file_paths:
-            self.file_paths = sorted(self.data_dir.rglob('*.npy'))
-            if self.file_paths:
-                self.file_ext = '.npy'
-
-        if not self.file_paths:
-            raise FileNotFoundError(
-                f"No {file_ext} or .npy files found in {data_dir} "
-                f"(searched recursively)")
+            raise FileNotFoundError(f"No .b2nd or .npy files found in {data_dir}")
 
         print(f"LightsheetBYOLDataset: found {len(self.file_paths)} files")
 
-        # Probe first file for shape info (blosc2 metadata, no decompression)
-        self._log_first_file()
+        # Build augmentations
+        self.view1_aug = Augment3D(**augment_config['view1'])
+        self.view2_aug = Augment3D(**augment_config['view2'])
 
-        # Set blosc2 threads for main process too
-        if HAS_BLOSC2:
-            blosc2.set_nthreads(1)
-
-    def _log_first_file(self):
-        """Log metadata about the first file (shape, dtype) without full decompression."""
+        # Print first file info (diagnostic only — NOT used as global cache)
         path = self.file_paths[0]
         if path.suffix == '.b2nd' and HAS_BLOSC2:
-            arr = blosc2.open(str(path), mode='r')
+            arr = blosc2.open(str(path), mode='r', mmap_mode='r')
             print(f"  First file: {path.name}, shape={arr.shape}, "
                   f"dtype={arr.dtype}, chunks={arr.chunks}")
-        elif path.suffix == '.npy':
-            # Read just the header
-            with open(path, 'rb') as f:
-                version = np.lib.format.read_magic(f)
-                shape, _, dtype = np.lib.format._read_array_header(f, version)
-            print(f"  First file: {path.name}, shape={shape}, dtype={dtype}")
 
     def __len__(self) -> int:
         return len(self.file_paths)
 
-    def _get_spatial_shape(self, raw_shape: tuple) -> Tuple[int, int, int]:
-        """Extract 3D spatial dims from raw shape, handling leading singletons.
-
-        Handles: (D,H,W), (1,D,H,W), (1,1,D,H,W)
-        """
+    @staticmethod
+    def _get_spatial_shape(raw_shape: tuple) -> Tuple[int, int, int]:
+        """Extract 3D spatial dims from raw shape, handling leading singletons."""
         shape = list(raw_shape)
         while len(shape) > 3 and shape[0] == 1:
             shape = shape[1:]
@@ -239,186 +174,148 @@ class LightsheetBYOLDataset(Dataset):
             return None
         return self.cache_dir / (path.stem + '.npy')
 
-    def _read_crops_blosc2(
-        self, path: Path, pos1: Tuple[int, ...], pos2: Tuple[int, ...]
+    @staticmethod
+    def _slice_crops_from_handle(
+        arr, spatial_shape: Tuple[int, int, int],
+        pos1: Tuple[int, ...], pos2: Tuple[int, ...],
+        crop_size: int,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Read two crop regions from a blosc2 file via partial decompression.
+        """Slice two crops from an already-opened blosc2 handle.
 
-        Only the chunks overlapping each crop are decompressed. For 96^3 crops
-        from 256^3 volumes, this decompresses ~11% of the volume instead of 100%.
+        Uses np.array(copy=True) so the returned arrays own their memory
+        (not backed by mmap storage — required for torch collation).
         """
-        arr = blosc2.open(str(path), mode='r')
-        c = self.crop_size
+        c = crop_size
         d1, h1, w1 = pos1
         d2, h2, w2 = pos2
 
-        # Determine indexing based on array shape (handle leading singleton dims)
         if arr.ndim == 3:
-            crop1 = np.asarray(arr[d1:d1+c, h1:h1+c, w1:w1+c], dtype=np.float32)
-            crop2 = np.asarray(arr[d2:d2+c, h2:h2+c, w2:w2+c], dtype=np.float32)
+            crop1 = np.array(arr[d1:d1+c, h1:h1+c, w1:w1+c], dtype=np.float32, copy=True)
+            crop2 = np.array(arr[d2:d2+c, h2:h2+c, w2:w2+c], dtype=np.float32, copy=True)
         elif arr.ndim == 4 and arr.shape[0] == 1:
-            crop1 = np.asarray(arr[0, d1:d1+c, h1:h1+c, w1:w1+c], dtype=np.float32)
-            crop2 = np.asarray(arr[0, d2:d2+c, h2:h2+c, w2:w2+c], dtype=np.float32)
+            crop1 = np.array(arr[0, d1:d1+c, h1:h1+c, w1:w1+c], dtype=np.float32, copy=True)
+            crop2 = np.array(arr[0, d2:d2+c, h2:h2+c, w2:w2+c], dtype=np.float32, copy=True)
         elif arr.ndim == 5 and arr.shape[0] == 1 and arr.shape[1] == 1:
-            crop1 = np.asarray(arr[0, 0, d1:d1+c, h1:h1+c, w1:w1+c], dtype=np.float32)
-            crop2 = np.asarray(arr[0, 0, d2:d2+c, h2:h2+c, w2:w2+c], dtype=np.float32)
+            crop1 = np.array(arr[0, 0, d1:d1+c, h1:h1+c, w1:w1+c], dtype=np.float32, copy=True)
+            crop2 = np.array(arr[0, 0, d2:d2+c, h2:h2+c, w2:w2+c], dtype=np.float32, copy=True)
         else:
-            raise ValueError(f"Unexpected blosc2 shape {arr.shape} in {path}")
+            raise ValueError(f"Unexpected blosc2 shape {arr.shape}")
+
+        # Paranoid shape check — if this fires, the file is smaller than
+        # crop_size on some axis, which compute_crop_positions should have
+        # caught. But belt-and-suspenders never hurts.
+        assert crop1.shape == (c, c, c), \
+            f"crop1 shape {crop1.shape} != expected ({c},{c},{c}), " \
+            f"file shape={arr.shape}, spatial={spatial_shape}, pos1={pos1}"
+        assert crop2.shape == (c, c, c), \
+            f"crop2 shape {crop2.shape} != expected ({c},{c},{c}), " \
+            f"file shape={arr.shape}, spatial={spatial_shape}, pos2={pos2}"
 
         return crop1, crop2
 
     def _read_crops_cached(
         self, cache_path: Path, pos1: Tuple[int, ...], pos2: Tuple[int, ...]
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Read two crop regions from a cached .npy file via memory-map.
-
-        The mmap means only the pages covering the crop are read from disk —
-        fast random access from local SSD without loading the full 64MB volume.
-        """
+        """Read two crop regions from a cached .npy file via memory-map."""
         vol = np.load(str(cache_path), mmap_mode='r')
         c = self.crop_size
         d1, h1, w1 = pos1
         d2, h2, w2 = pos2
-
-        # Cached files are always saved as 3D (D, H, W)
-        crop1 = np.array(vol[d1:d1+c, h1:h1+c, w1:w1+c], dtype=np.float32)
-        crop2 = np.array(vol[d2:d2+c, h2:h2+c, w2:w2+c], dtype=np.float32)
-        return crop1, crop2
-
-    def _cache_full_volume(self, path: Path, cache_path: Path) -> None:
-        """Decompress full volume and save to local SSD cache.
-
-        Called once per file during the first epoch. Subsequent epochs
-        read from cache via mmap.
-        """
-        try:
-            if path.suffix == '.b2nd' and HAS_BLOSC2:
-                arr = blosc2.open(str(path), mode='r')
-                vol = np.asarray(arr[:], dtype=np.float32)
-            else:
-                vol = np.load(str(path)).astype(np.float32)
-
-            # Squeeze to 3D for consistent cache format
-            while vol.ndim > 3 and vol.shape[0] == 1:
-                vol = vol.squeeze(0)
-
-            np.save(str(cache_path), vol)
-        except (OSError, Exception):
-            pass  # cache full, permissions, etc. — just skip
-
-    def _read_full_and_cache(
-        self, path: Path, cache_path: Path,
-        pos1: Tuple[int, ...], pos2: Tuple[int, ...]
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Read full volume, extract crops, and save cache in one pass.
-
-        On the first epoch when caching is enabled, this does 1 full read
-        instead of 2 partial reads + 1 full read for caching (3x I/O).
-        """
-        arr = blosc2.open(str(path), mode='r')
-        vol = np.asarray(arr[:], dtype=np.float32)
-
-        # Squeeze to 3D
-        while vol.ndim > 3 and vol.shape[0] == 1:
-            vol = vol.squeeze(0)
-
-        # Extract crops from the in-memory volume
-        c = self.crop_size
-        d1, h1, w1 = pos1
-        d2, h2, w2 = pos2
-        crop1 = vol[d1:d1+c, h1:h1+c, w1:w1+c].copy()
-        crop2 = vol[d2:d2+c, h2:h2+c, w2:w2+c].copy()
-
-        # Save full volume to cache (async-ish: fire and forget)
-        try:
-            np.save(str(cache_path), vol)
-        except (OSError, Exception):
-            pass  # disk full, permissions — skip silently
-
+        crop1 = np.array(vol[d1:d1+c, h1:h1+c, w1:w1+c], dtype=np.float32, copy=True)
+        crop2 = np.array(vol[d2:d2+c, h2:h2+c, w2:w2+c], dtype=np.float32, copy=True)
         return crop1, crop2
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Load a volume and return two augmented crop views.
-
-        Strategy:
-          1. Check local cache → mmap + slice (fast, ~ms)
-          2. Else: blosc2 partial read from NFS (slower, ~seconds)
-             Also triggers cache save of full volume for next epoch.
-
-        Returns:
-            dict with 'view1', 'view2' (each [1, D, H, W]), and 'index'
-        """
+        """Load a volume and return two augmented crop views."""
         try:
             return self._load_sample(idx)
         except Exception as e:
-            # Fallback: pick a random different sample (matches nnssl behavior)
+            # Fallback: pick a random different sample
             fallback_idx = int(np.random.randint(0, len(self)))
             try:
                 return self._load_sample(fallback_idx)
             except Exception:
-                # Last resort: return zeros (should be extremely rare)
+                # Last resort: return zeros with .clone() for owned storage
                 c = self.crop_size
                 zeros = torch.zeros(1, c, c, c)
-                return {'view1': zeros, 'view2': zeros, 'index': idx}
+                return {'view1': zeros.clone(), 'view2': zeros.clone(), 'index': idx}
 
     def _load_sample(self, idx: int) -> Dict[str, torch.Tensor]:
         path = self.file_paths[idx]
         cache_path = self._cache_path(path)
 
-        # --- Determine spatial shape (metadata only, no decompression) ---
+        # =================================================================
+        # CORE FIX: One blosc2.open() per sample. Read shape AND crops
+        # from the SAME handle. No global shape cache — files may differ.
+        # =================================================================
+
         if cache_path is not None and cache_path.exists():
-            # Cached: read npy header for shape
+            # --- Cached path: read npy header for REAL shape, then slice ---
             with open(cache_path, 'rb') as f:
                 version = np.lib.format.read_magic(f)
                 raw_shape, _, _ = np.lib.format._read_array_header(f, version)
             spatial_shape = self._get_spatial_shape(raw_shape)
-            use_cache = True
-        elif path.suffix == '.b2nd' and HAS_BLOSC2:
-            arr_handle = blosc2.open(str(path), mode='r')
-            spatial_shape = self._get_spatial_shape(arr_handle.shape)
-            use_cache = False
-        elif path.suffix == '.npy':
-            with open(path, 'rb') as f:
-                version = np.lib.format.read_magic(f)
-                raw_shape, _, _ = np.lib.format._read_array_header(f, version)
-            spatial_shape = self._get_spatial_shape(raw_shape)
-            use_cache = False
-        else:
-            raise ValueError(f"Unsupported file format: {path.suffix}")
-
-        # --- Compute crop positions (data-free) ---
-        pos1, pos2 = compute_crop_positions(
-            spatial_shape, self.crop_size, self.min_overlap)
-
-        # --- Read crops ---
-        if use_cache:
+            pos1, pos2 = compute_crop_positions(
+                spatial_shape, self.crop_size, self.min_overlap)
             crop1, crop2 = self._read_crops_cached(cache_path, pos1, pos2)
+
         elif path.suffix == '.b2nd' and HAS_BLOSC2:
+            # --- Single open: shape + crops from one handle ---
+            arr = blosc2.open(str(path), mode='r', mmap_mode='r')
+            spatial_shape = self._get_spatial_shape(arr.shape)
+            pos1, pos2 = compute_crop_positions(
+                spatial_shape, self.crop_size, self.min_overlap)
+
             if cache_path is not None and not cache_path.exists():
-                # First epoch with caching: read FULL volume once, extract
-                # crops, then save cache. This is 1 full read instead of
-                # 2 partial reads + 1 full read for caching.
-                crop1, crop2 = self._read_full_and_cache(path, cache_path, pos1, pos2)
+                # First epoch with caching: read full, extract, save
+                vol = np.array(arr[:], dtype=np.float32, copy=True)
+                while vol.ndim > 3 and vol.shape[0] == 1:
+                    vol = vol.squeeze(0)
+                c = self.crop_size
+                d1, h1, w1 = pos1
+                d2, h2, w2 = pos2
+                crop1 = vol[d1:d1+c, h1:h1+c, w1:w1+c].copy()
+                crop2 = vol[d2:d2+c, h2:h2+c, w2:w2+c].copy()
+                try:
+                    np.save(str(cache_path), vol)
+                except (OSError, Exception):
+                    pass
             else:
-                # No caching: partial reads only (fast, ~11% of volume)
-                crop1, crop2 = self._read_crops_blosc2(path, pos1, pos2)
-        else:
-            # .npy fallback: load full and slice
+                # No caching: partial reads (~11% of volume)
+                crop1, crop2 = self._slice_crops_from_handle(
+                    arr, spatial_shape, pos1, pos2, self.crop_size)
+
+        elif path.suffix == '.npy':
+            # --- .npy fallback ---
             vol = np.load(str(path)).astype(np.float32)
             while vol.ndim > 3 and vol.shape[0] == 1:
                 vol = vol.squeeze(0)
+            spatial_shape = vol.shape[:3]
+            pos1, pos2 = compute_crop_positions(
+                spatial_shape, self.crop_size, self.min_overlap)
             c = self.crop_size
             d1, h1, w1 = pos1
             d2, h2, w2 = pos2
-            crop1 = vol[d1:d1+c, h1:h1+c, w1:w1+c]
-            crop2 = vol[d2:d2+c, h2:h2+c, w2:w2+c]
+            crop1 = vol[d1:d1+c, h1:h1+c, w1:w1+c].copy()
+            crop2 = vol[d2:d2+c, h2:h2+c, w2:w2+c].copy()
+        else:
+            raise ValueError(f"Unsupported file format: {path.suffix}")
 
-        # --- To tensor: [1, D, H, W] ---
-        crop1_t = torch.from_numpy(crop1).float().unsqueeze(0)
-        crop2_t = torch.from_numpy(crop2).float().unsqueeze(0)
+        # --- To tensor: ensure owned, contiguous memory ---
+        crop1 = np.ascontiguousarray(crop1, dtype=np.float32)
+        crop2 = np.ascontiguousarray(crop2, dtype=np.float32)
+        crop1_t = torch.from_numpy(crop1).unsqueeze(0).clone()  # [1, D, H, W]
+        crop2_t = torch.from_numpy(crop2).unsqueeze(0).clone()
+
+        # Final shape assertion — catch ANY mismatch before collation
+        c = self.crop_size
+        expected = (1, c, c, c)
+        assert crop1_t.shape == expected, \
+            f"view1 shape {crop1_t.shape} != {expected}, file={path.name}"
+        assert crop2_t.shape == expected, \
+            f"view2 shape {crop2_t.shape} != {expected}, file={path.name}"
 
         # --- Apply augmentations ---
-        # Augment3D expects [B, C, D, H, W], so add and remove batch dim
         view1 = self.view1_aug(crop1_t.unsqueeze(0)).squeeze(0)
         view2 = self.view2_aug(crop2_t.unsqueeze(0)).squeeze(0)
 
@@ -467,8 +364,8 @@ class SyntheticBYOLDataset(Dataset):
         c = self.crop_size
         d1, h1, w1 = pos1
         d2, h2, w2 = pos2
-        crop1 = torch.from_numpy(vol[d1:d1+c, h1:h1+c, w1:w1+c]).float().unsqueeze(0)
-        crop2 = torch.from_numpy(vol[d2:d2+c, h2:h2+c, w2:w2+c]).float().unsqueeze(0)
+        crop1 = torch.from_numpy(vol[d1:d1+c, h1:h1+c, w1:w1+c].copy()).float().unsqueeze(0)
+        crop2 = torch.from_numpy(vol[d2:d2+c, h2:h2+c, w2:w2+c].copy()).float().unsqueeze(0)
 
         view1 = self.view1_aug(crop1.unsqueeze(0)).squeeze(0)
         view2 = self.view2_aug(crop2.unsqueeze(0)).squeeze(0)
@@ -492,11 +389,7 @@ def create_byol_dataloader(
     synthetic_volume_size: int = 32,
     cache_dir: Optional[str] = None,
 ) -> DataLoader:
-    """Create a DataLoader for BYOL pretraining.
-
-    If data_dir is provided, loads real blosc2/npy data.
-    If synthetic=True, uses SyntheticBYOLDataset for testing.
-    """
+    """Create a DataLoader for BYOL pretraining."""
     if synthetic or data_dir is None:
         crop = min(crop_size, synthetic_volume_size // 2)
         dataset = SyntheticBYOLDataset(
@@ -519,7 +412,7 @@ def create_byol_dataloader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=True,
-        persistent_workers=num_workers > 0,
-        prefetch_factor=4 if num_workers > 0 else None,
+        persistent_workers=False,
+        prefetch_factor=2 if num_workers > 0 else None,
         worker_init_fn=_worker_init_fn,
     )

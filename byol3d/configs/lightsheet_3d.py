@@ -51,7 +51,9 @@ def get_config(num_epochs: int = 300, batch_size: int = 4,
             min_overlap=0.4,
             num_workers=8,
             pin_memory=True,
-            cache_dir='/tmp/byol_cache',   # local SSD cache for NFS volumes
+            cache_dir=None,    # None = rely on OS page cache (needs --mem=128G+)
+                               # Set to '/tmp/byol_cache' for explicit local SSD cache
+                               # (warning: 10k patches × 64MB = 640GB on /tmp)
             in_channels=1,
         ),
 

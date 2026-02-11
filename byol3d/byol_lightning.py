@@ -331,6 +331,10 @@ def main():
                         help='Override dataset size (auto-detected from data-dir)')
     parser.add_argument('--num-workers', type=int, default=None,
                         help='Override num_workers for DataLoader')
+    parser.add_argument('--cache-dir', type=str, default=None,
+                        help='Local SSD cache dir (e.g. /tmp/byol_cache). '
+                             'Warning: 10k patches need ~640GB. '
+                             'Default: None (rely on OS page cache with sufficient RAM)')
     args = parser.parse_args()
 
     # -- Build config --
@@ -370,8 +374,13 @@ def main():
     samples_per_gpu = cfg.get('num_samples', 1000) // num_devices_for_calc
     cfg['steps_per_epoch'] = max(samples_per_gpu // cfg['batch_size'], 1)
     cfg['max_steps'] = cfg['num_epochs'] * cfg['steps_per_epoch']
-    cfg['lr_schedule']['warmup_steps'] = cfg['lr_schedule'].get(
-        'warmup_epochs', 10) * cfg['steps_per_epoch']
+
+    # Warmup: use warmup_epochs from config, but cap at 10% of total training
+    # for short runs (e.g. --epochs 1 shouldn't spend the whole run warming up)
+    warmup_epochs = cfg['lr_schedule'].get('warmup_epochs', 10)
+    warmup_from_config = warmup_epochs * cfg['steps_per_epoch']
+    warmup_cap = max(cfg['max_steps'] // 10, 1)  # at most 10% of total
+    cfg['lr_schedule']['warmup_steps'] = min(warmup_from_config, warmup_cap)
 
     # -- Auto-detect devices --
     if args.devices is not None:
@@ -382,6 +391,10 @@ def main():
     # Override num_workers if specified
     if args.num_workers is not None:
         cfg['data']['num_workers'] = args.num_workers
+
+    # Override cache_dir if specified
+    if args.cache_dir is not None:
+        cfg['data']['cache_dir'] = args.cache_dir
 
     accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
 
