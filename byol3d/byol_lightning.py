@@ -25,6 +25,9 @@ Usage:
 
     # Smoke test:
     python -m byol3d.byol_lightning --config smoke
+
+    # Resume from checkpoint:
+    python -m byol3d.byol_lightning --config full --resume /path/to/byol3d_epoch0050.pt
 """
 
 from __future__ import annotations
@@ -246,50 +249,163 @@ class BYOLLightningModule(pl.LightningModule):
             cache_dir=self.cfg['data'].get('cache_dir', None),
         )
 
+    # ----- Resume from BYOL checkpoint -----
+
+    def load_byol_checkpoint(self, ckpt_path: str):
+        """Load model weights (and optionally optimizer/scheduler) from a
+        BYOL checkpoint saved by BYOLCheckpointCallback.
+
+        This restores online + target state dicts. If the checkpoint also
+        contains optimizer/scheduler state (saved by updated callback),
+        those will be restored after configure_optimizers() runs via
+        the resume_optimizer_state stored on the module.
+
+        Args:
+            ckpt_path: path to byol3d_epoch*.pt checkpoint file.
+
+        Returns:
+            dict with 'epoch' and 'global_step' from the checkpoint.
+        """
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+
+        # Restore model weights
+        self.online.load_state_dict(ckpt['online_state_dict'])
+        self.target.load_state_dict(ckpt['target_state_dict'])
+
+        # Stash optimizer/scheduler state for restoration after
+        # configure_optimizers() creates the optimizer (see main() below)
+        if 'optimizer_state_dict' in ckpt:
+            self._resume_optimizer_state = ckpt['optimizer_state_dict']
+        if 'scheduler_state_dict' in ckpt:
+            self._resume_scheduler_state = ckpt['scheduler_state_dict']
+
+        resume_info = {
+            'epoch': ckpt['epoch'],
+            'global_step': ckpt['global_step'],
+        }
+        print(f'Loaded BYOL checkpoint: {ckpt_path}')
+        print(f'  Completed epochs: {resume_info["epoch"]}, '
+              f'global_step: {resume_info["global_step"]}')
+        return resume_info
+
 
 # ---------------------------------------------------------------------------
 # Custom checkpoint callback (saves encoder_state_dict for fine-tuning)
 # ---------------------------------------------------------------------------
 
 class BYOLCheckpointCallback(pl.Callback):
-    """Save encoder-only checkpoint compatible with SegmentationUNet3D.from_byol_encoder."""
+    """Save encoder-only checkpoint compatible with SegmentationUNet3D.from_byol_encoder.
+
+    Now also saves optimizer and LR scheduler state for resumable training.
+    """
 
     def __init__(self, save_dir: str, save_every_epochs: int = 50):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.save_every_epochs = save_every_epochs
 
+    def _get_optimizer_scheduler_state(self, trainer, pl_module):
+        """Extract optimizer and scheduler state dicts."""
+        opt_state = None
+        sched_state = None
+        if trainer.optimizers:
+            opt_state = trainer.optimizers[0].state_dict()
+        if trainer.lr_scheduler_configs:
+            sched_state = trainer.lr_scheduler_configs[0].scheduler.state_dict()
+        return opt_state, sched_state
+
     def on_train_epoch_end(self, trainer, pl_module):
         epoch = trainer.current_epoch + 1
         if epoch % self.save_every_epochs == 0 or epoch == trainer.max_epochs:
             ckpt_path = self.save_dir / f'byol3d_epoch{epoch:04d}.pt'
+            opt_state, sched_state = self._get_optimizer_scheduler_state(
+                trainer, pl_module)
+
             # Save in our standard format (compatible with finetune_segmentation.py)
-            torch.save({
+            # Now also includes optimizer + scheduler for resumable training
+            save_dict = {
                 'epoch': epoch,
                 'global_step': trainer.global_step,
                 'online_state_dict': pl_module.online.state_dict(),
                 'target_state_dict': pl_module.target.state_dict(),
                 'encoder_state_dict': pl_module.online.encoder.state_dict(),
                 'config': pl_module.cfg,
-            }, ckpt_path)
+            }
+            if opt_state is not None:
+                save_dict['optimizer_state_dict'] = opt_state
+            if sched_state is not None:
+                save_dict['scheduler_state_dict'] = sched_state
+
+            torch.save(save_dict, ckpt_path)
             if trainer.is_global_zero:
                 print(f'  -> Saved BYOL checkpoint: {ckpt_path}')
 
     def on_train_end(self, trainer, pl_module):
         """Always save a final checkpoint."""
         final_path = self.save_dir / 'byol3d_pretrain.pt'
-        torch.save({
+        opt_state, sched_state = self._get_optimizer_scheduler_state(
+            trainer, pl_module)
+
+        save_dict = {
             'epoch': trainer.current_epoch + 1,
             'global_step': trainer.global_step,
             'online_state_dict': pl_module.online.state_dict(),
             'target_state_dict': pl_module.target.state_dict(),
             'encoder_state_dict': pl_module.online.encoder.state_dict(),
             'config': pl_module.cfg,
-        }, final_path)
+        }
+        if opt_state is not None:
+            save_dict['optimizer_state_dict'] = opt_state
+        if sched_state is not None:
+            save_dict['scheduler_state_dict'] = sched_state
+
+        torch.save(save_dict, final_path)
         if trainer.is_global_zero:
             print(f'Final model saved: {final_path}')
             print(f"Encoder state_dict key: 'encoder_state_dict' "
                   f"(use for SegmentationUNet3D.from_byol_encoder)")
+
+
+# ---------------------------------------------------------------------------
+# Resume helper: restore optimizer/scheduler + Lightning fit_loop counters
+# ---------------------------------------------------------------------------
+
+class ResumeCallback(pl.Callback):
+    """Restores optimizer/scheduler state and fast-forwards Lightning's
+    fit_loop counters so training resumes from the correct epoch/step.
+
+    This is needed because we use a custom checkpoint format (not Lightning's
+    native .ckpt), so we handle resume manually.
+    """
+
+    def __init__(self, resume_epoch: int, resume_global_step: int):
+        self.resume_epoch = resume_epoch
+        self.resume_global_step = resume_global_step
+
+    def on_train_start(self, trainer, pl_module):
+        """Restore optimizer/scheduler state after Lightning has created them."""
+        # Restore optimizer state if available
+        if hasattr(pl_module, '_resume_optimizer_state'):
+            opt = trainer.optimizers[0]
+            opt.load_state_dict(pl_module._resume_optimizer_state)
+            del pl_module._resume_optimizer_state
+            print(f'  Restored optimizer state (AdamW momentum buffers)')
+
+        # Restore scheduler state if available
+        if hasattr(pl_module, '_resume_scheduler_state'):
+            sched = trainer.lr_scheduler_configs[0].scheduler
+            sched.load_state_dict(pl_module._resume_scheduler_state)
+            del pl_module._resume_scheduler_state
+            print(f'  Restored LR scheduler state')
+        elif self.resume_global_step > 0:
+            # No scheduler state saved (old checkpoint format) — manually
+            # fast-forward the LR scheduler to the correct step
+            sched = trainer.lr_scheduler_configs[0].scheduler
+            print(f'  Fast-forwarding LR scheduler by {self.resume_global_step} steps...')
+            for _ in range(self.resume_global_step):
+                sched.step()
+            print(f'  LR scheduler at step {sched.last_epoch}, '
+                  f'lr={trainer.optimizers[0].param_groups[0]["lr"]:.2e}')
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +451,9 @@ def main():
                         help='Local SSD cache dir (e.g. /tmp/byol_cache). '
                              'Warning: 10k patches need ~640GB. '
                              'Default: None (rely on OS page cache with sufficient RAM)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to BYOL checkpoint to resume training from '
+                             '(e.g. /path/to/byol3d_epoch0050.pt)')
     args = parser.parse_args()
 
     # -- Build config --
@@ -419,6 +538,16 @@ def main():
     # -- Create model --
     model = BYOLLightningModule(cfg)
 
+    # -- Resume from checkpoint if specified --
+    resume_epoch = 0
+    resume_global_step = 0
+    if args.resume is not None:
+        resume_info = model.load_byol_checkpoint(args.resume)
+        resume_epoch = resume_info['epoch']
+        resume_global_step = resume_info['global_step']
+        print(f'Will resume training from epoch {resume_epoch}, '
+              f'step {resume_global_step}')
+
     # -- Optional SyncBatchNorm for MLP heads --
     if args.sync_batchnorm and num_devices > 1:
         # Only convert the online network's BatchNorm1d (in projector/predictor)
@@ -454,6 +583,13 @@ def main():
         ),
     ]
 
+    # Add resume callback if resuming
+    if args.resume is not None:
+        callbacks.append(ResumeCallback(
+            resume_epoch=resume_epoch,
+            resume_global_step=resume_global_step,
+        ))
+
     # -- Trainer --
     trainer = pl.Trainer(
         accelerator=accelerator,
@@ -472,6 +608,14 @@ def main():
         enable_checkpointing=False,  # we use our own callback
         num_sanity_val_steps=0,
     )
+
+    # -- Fast-forward fit_loop if resuming --
+    if args.resume is not None and resume_epoch > 0:
+        # Tell Lightning to start from the correct epoch and step.
+        # This skips already-completed epochs rather than re-running them.
+        trainer.fit_loop.epoch_progress.current.completed = resume_epoch
+        trainer.fit_loop.epoch_progress.current.processed = resume_epoch
+        print(f'Fast-forwarded Lightning fit_loop to epoch {resume_epoch}')
 
     # -- Train! --
     trainer.fit(model)
