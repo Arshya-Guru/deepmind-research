@@ -413,6 +413,6 @@ def create_byol_dataloader(
         pin_memory=pin_memory,
         drop_last=True,
         persistent_workers=False,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
         worker_init_fn=_worker_init_fn,
     )
